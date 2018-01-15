@@ -1,0 +1,218 @@
+= Dense Node Finder
+:branch: 1.0
+:root: https://github.com/InverseFalcon/DenseNodeFinder/blob/{branch}/src
+
+This project includes procedures for efficiently finding (along an expanded path from starting nodes) dense nodes in your graph.
+This can be useful as an investigative tool for identifying dense nodes that may be responsible for performance issues in your queries.
+
+The procedures accept parameters for the relationship types/directions, as well as the degree threshold of these relationships to be considered dense.
+
+These are based upon the path expander procs from APOC Procedures, and use the same config parameters, including the link:https://neo4j-contrib.github.io/neo4j-apoc-procedures/#_label_filter[labelFilter] and the link:https://neo4j-contrib.github.io/neo4j-apoc-procedures/#_relationship_filter[relationship-type-direction patterns] for the `relationshipFilter`.
+
+One important difference is the absence of termination filter `/` and end node filter `>` support in the `labelFilter`,
+as the nodes returned are determined by relationship density, not labels.
+
+The new procedures are:
+
+=== Dense node finder procedures
+
+[options=header, cols="m,a,m"]
+|===
+|Procedure     | Description | Modeled after APOC Procedure
+|expandTo.denseNodes.paths(startNode <id>\|Node\|list, {minLevel, maxLevel, relationshipFilter, labelFilter, uniqueness:'RELATIONSHIP_PATH', bfs:true, filterStartNode:false, optional:false, denseRels:'', degree:1000, continueBelow:0}) | Finds all paths to dense nodes. | apoc.path.expandConfig()
+|expandTo.denseNodes.singlePath(maxLevel, relationshipFilter, labelFilter, bfs:true, filterStartNode:false, optional:false, denseRels:'', degree:1000, continueBelow:0}) | Finds the single shortest path to each dense node. | apoc.path.spanningTree()
+|expandTo.denseNodes.nodes(maxLevel, relationshipFilter, labelFilter, bfs:true, filterStartNode:false, optional:false, denseRels:'', degree:1000, continueBelow:0}) | Finds all dense nodes. | apoc.path.subgraphNodes()
+|===
+
+
+Three new config parameters drive these procedures:
+
+[options=header, cols="m,a,a"]
+|===
+|Config parameter     | Description | Default value
+|denseRels | The rel-type-direction pattern for relationships considered in the density check. | `""`, meaning all types and directions.
+|degree | The degree threshold of `denseRels` for a node to be considered dense and returned by these procedures. | 1000
+|continueBelow | When a dense node is found, expansion will continue if the degrees of `denseRels` are less than this threshold.
+                          If the config param `degree` is >= to `continueBelow`, then expansion will never continue beyond the first dense node found in each path. | 0, which always stops expansion past dense nodes.
+|===
+
+=== Examples of use
+
+We'll use the movies graph (from `:play movies` via the Neo4j browser) for these examples.
+
+For quick reference later, let's find some of the top dense nodes in the graph:
+
+[source,cypher]
+----
+MATCH (n)
+WITH n, size((n)-[:ACTED_IN]-()) as cnt
+ORDER BY cnt DESC
+LIMIT 7
+RETURN head(labels(n)) + ': ' + coalesce(n.name, n.title) as node, cnt
+----
+
+We get back:
+
+[options=header, cols="a,a"]
+|===
+|node | cnt
+|"Movie: A Few Good Men" | 12
+|"Person: Tom Hanks" | 12
+|"Movie: Jerry Maguire" | 9
+|"Movie: The Green Mile" | 8
+|"Movie: Speed Racer" | 7
+|"Movie: Stand By Me" | 7
+|"Person: Keanu Reeves" | 7
+|===
+
+The movies graph is rather interconnected. Let's try to use the new procedures to find :Person nodes in the graph that expand out to only two dense nodes,
+where the dense nodes prevent further expansion to the rest of the graph (and the other dense nodes).
+
+We'll only consider actors, so we'll want the :Person node to have an ACTED_IN relationship.
+We don't know if the dense node will be a :Person or a :Movie, so we can use `coalesce()` to get the appropriate property, getting the `name` if there is no `title`.
+We also don't want to consider any of the dense nodes themselves, so we'll set `filterStartNode:true`, (so dense nodes will not expand past themselves so their count will always be 1).
+
+
+[source,cypher]
+----
+MATCH (n:Person)
+WHERE (n)-[:ACTED_IN]-()
+CALL expandTo.denseNodes.nodes(n, {degree:x, denseRels:'ACTED_IN', relationshipFilter:'ACTED_IN', filterStartNode:true}) YIELD node
+WITH n, collect(node) as denseNodes
+WHERE size(denseNodes) = 2
+RETURN n.name as name, [node in denseNodes | coalesce(node.title, node.name)] as denseNodes
+----
+
+As for what degree to use, we can only use a maximum of 9, since there are exactly two nodes with density > 9, so all nodes in the graph (except the two dense nodes themselves) would be returned with degree > 9.
+
+There are no results with `degree:9`, but one result at `degree:8`.
+
+[options=header, cols="a,m"]
+|===
+|name | denseNodes
+|"Bonnie Hunt" | ["The Green Mile","Jerry Maguire"]
+|===
+
+Sure enough, the node for Bonnie Hunt is only linked to the nodes for The Green Mile and Jerry Maguire.
+
+Let's look one more degree down, `degree:7`. We find 6 results:
+
+[options=header, cols="a,m"]
+|===
+|name | denseNodes
+|"Liv Tyler" |	["Tom Hanks", "Keanu Reeves"]
+|"Jerry O'Connell"|	["Stand By Me", "Jerry Maguire"]
+|"Al Pacino"|	["Keanu Reeves", "Tom Hanks"]
+|"Bonnie Hunt"|	["The Green Mile", "Jerry Maguire"]
+|"Charlize Theron"|	["Tom Hanks", "Keanu Reeves"]
+|"Kiefer Sutherland"|	["Stand By Me", "A Few Good Men"]
+|===
+
+
+Let's take a look at the paths to dense nodes from Liv Tyler:
+
+[source,cypher]
+----
+MATCH (n:Person)
+WHERE n.name = 'Liv Tyler'
+CALL expandTo.denseNodes.paths(n, {degree:7, denseRels:'ACTED_IN', relationshipFilter:'ACTED_IN', filterStartNode:true}) YIELD path
+RETURN path
+----
+
+We find 2 paths. Here's a pseudo-cypher visual (omitting relationship name, since we know they're all `ACTED_IN`):
+
+[source,cypher]
+----
+(Liv Tyler)-->(That Thing You Do)<--(Charlize Theron)-->(The Devil's Advocate)<--(Keanu Reeves)
+
+(Liv Tyler)-->(That Thing You Do)<--(Tom Hanks)
+----
+
+If we wanted to run that same query at a higher degree, it would cause execution to hang, since nearly all of the graph would be reachable since those two nodes wouldn't be preventing expansion beyond them,
+and there are a huge number of unique paths throughout the graph to the remaining dense nodes.
+
+To prevent a hang, we could use `expandTo.denseNodes.singlePath()` instead, which would get us a single shortest path to each of the remaining dense nodes,
+though we would probably want `expandTo.denseNodes.nodes()` instead.
+
+___
+
+To be able to do something interesting with `continueBelow`, we'll need to lower the degree for dense nodes:
+
+[source,cypher]
+----
+MATCH (n:Person)
+WHERE (n)-[:ACTED_IN]-()
+CALL expandTo.denseNodes.nodes(n, {degree:3, denseRels:'ACTED_IN', relationshipFilter:'ACTED_IN', filterStartNode:true}) YIELD node
+WITH n, collect(node) as denseNodes
+WHERE size(denseNodes) = 3
+RETURN n.name as name, [node in denseNodes | coalesce(node.title, node.name) + ' - ' + apoc.node.degree(node, 'ACTED_IN')] as denseNode
+----
+
+We get:
+
+[options=header, cols="a,m"]
+|===
+|name | denseNodes
+|"James Marshall"|	["Ninja Assassin - 4", "V for Vendetta - 5", "A Few Good Men - 12"]
+|===
+
+But if we set `continueBelow:4`, now we get:
+
+[options=header, cols="a,m"]
+|===
+|name | denseNodes
+|"Diane Keaton"	| ["Something's Gotta Give - 3", "Jack Nicholson - 5", "Keanu Reeves - 7"]
+|"James Marshall"|	["Ninja Assassin - 4", "V for Vendetta - 5", "A Few Good Men - 12"]
+|===
+
+Let's query for the paths from Diane Keaton to find out why:
+
+[source,cypher]
+----
+MATCH (n:Person)
+WHERE n.name = 'Diane Keaton'
+CALL expandTo.denseNodes.paths(n, {degree:3, continueBelow:4, denseRels:'ACTED_IN', relationshipFilter:'ACTED_IN', filterStartNode:true}) YIELD path
+RETURN path
+----
+
+We find 3 paths:
+
+[source,cypher]
+----
+(Diane Keaton)-->(Something's Gotta Give)
+
+(Diane Keaton)-->(Something's Gotta Give)<--(Jack Nicholson)
+
+(Diane Keaton)-->(Something's Gotta Give)<--(Keanu Reeves)
+----
+
+From the degree info from the node results above, we know how the traversal executed:
+
+1. We expanded from Diane Keaton to Something's Gotta Give. It has degree 3, and we defined dense nodes as having degree 3 in our procedure call, so this dense node will be one of the results.
+
+2. We configured the call so that when we reach a dense node, we continue expansion beyond it when below degree 4.
+Expansion will continue past Something's Gotta Give.
+
+3. Jack Nicholson (degree 5) and Keanu Reeves (degree 7) are the only other two actors for that film in the movies graph.
+They are both dense nodes, and neither of them is below degree 4, so expansions stop at both of them.
+
+=== Dependencies
+
+This project requires a Neo4j dependency, defaulting to version 3.3.1.
+
+Please configure the Neo4j version to the version you are using in the pom.xml file before building.
+
+
+== Building
+
+This project uses maven, to build a jar-file with the procedure in this
+project, simply package the project with maven:
+
+    mvn clean package
+
+This will produce a jar-file,`target/DenseNodeFinder-1.0.0-SNAPSHOT.jar`,
+that can be deployed in the `plugin` directory of your Neo4j instance.
+
+== License
+
+Apache License V2, see LICENSE
